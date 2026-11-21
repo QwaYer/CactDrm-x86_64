@@ -105,16 +105,23 @@ libdrm_so = custom_target('libdrm-so',
 # ------------------------------------------------------------------------------
 
 inc_dir = lr_lib / 'include' / 'libdrm'
+top_inc = lr_lib / 'include'
 libdrm_headers = ['xf86drm.h', 'xf86drmMode.h', 'libdrm_lists.h', 'libdrm_macros.h']
+# libdrm installs libsync.h at the top of the include directory (not under
+# libdrm/), and Mesa includes it as <libsync.h> — so it goes to top_inc.
+top_headers = ['libsync.h']
 
 _headers = ''
 foreach h : libdrm_headers
   _headers += 'cp -f "' + src_root / h + '" "' + inc_dir + '/' + h + '"; '
 endforeach
+foreach h : top_headers
+  _headers += 'cp -f "' + src_root / h + '" "' + top_inc + '/' + h + '"; '
+endforeach
 
 run_target('stage',
   command: [bash, '-c',
-            'set -e; mkdir -p "' + lr_lib + '" "' + inc_dir + '"; ' +
+            'set -e; mkdir -p "' + lr_lib + '" "' + inc_dir + '" "' + top_inc + '"; ' +
             'cp -f "$1" "' + lr_lib + '/libdrm.so"; ' + _headers,
             'bash', libdrm_so])
 
@@ -128,6 +135,8 @@ run_target('pkg',
             'cp -f "$3" "$1/payload/lib/libdrm.so"; ' +
             'for h in ' + ' '.join(libdrm_headers) + '; do ' +
             'cp -f "' + src_root + '/$h" "$1/payload/include/libdrm/$h"; done; ' +
+            'for h in ' + ' '.join(top_headers) + '; do ' +
+            'cp -f "' + src_root + '/$h" "$1/payload/include/$h"; done; ' +
             python3.full_path() + ' "$4" build "$1" --repo "$2"; ' +
             python3.full_path() + ' "$4" index "$2"',
             'bash', pkg_src, pkg_repo, libdrm_so, cpkg_py])
