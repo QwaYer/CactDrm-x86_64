@@ -1,362 +1,133 @@
-# Copyright © 2017-2018 Intel Corporation
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 CactOS Project
 
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
+# ==============================================================================
+# CactDrm-x86_64 — the libdrm core for CactOS userspace
+# ==============================================================================
+#
+# Upstream sources are carried in place, but the build system is CactOS's own:
+# upstream's meson.build / meson_options.txt are removed (see UPSTREAM.md) and
+# only the core library is built — no per-driver backend, no udev, no tests.
+# CactOS reaches the kernel through a single /dev/dri node.
+#
+#   meson setup build-meson --cross-file cross/x86_64-cact-clang.ini
+#   ninja -C build-meson            # libdrm.so + libdrm.a
+#   ninja -C build-meson stage      # libdrm.so + headers into LocalRepo
+#   ninja -C build-meson pkg        # repo/libdrm-<ver>.cpkg
+#
+# The DRM uapi headers are taken from the kernel's Cact/drivers/gpu/drm/uapi,
+# not from libdrm's own include/drm: those copies are already ported to compile
+# standalone (drm_types.h + drm_ioctl.h stand in for <linux/types.h> and
+# <asm/ioctl.h>) and they are the ABI the kernel actually decodes, so the two
+# sides cannot drift.  libdrm's generated fourcc table is built from that same
+# header.
+# ==============================================================================
 
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
+project('cact-libdrm', 'c',
+  version: '2.4.134',
+  meson_version: '>=1.0.0',
+  default_options: [
+    'c_std=gnu11',
+    'warning_level=0',            # libdrm is vendored; -w below
+    'buildtype=plain',
+    'b_staticpic=false',
+  ])
 
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
+fs = import('fs')
+bash = find_program('bash')
+ld = find_program('ld')
+python3 = find_program('python3')
 
-# The versioning should always stay at 2.4.x. If bumping away from this,
-# you must ensure that all users of patch_ver are changed such that DSO versions
-# continuously increment (e.g. blindly bumping from 2.4.122 to 2.5.0 would
-# roll the libdrm DSO versioning from libdrm.so.2.122.0 back to libdrm.so.2.0.0
-# which would be bad)
-project(
-  'libdrm',
-  ['c'],
-  version : '2.4.134',
-  license : 'MIT',
-  meson_version : '>= 0.59',
-  default_options : ['buildtype=debugoptimized', 'c_std=c11'],
-)
+src_root = meson.project_source_root()
+build_root = meson.current_build_dir()
 
-patch_ver = meson.project_version().split('.')[2]
+# Path options are relative to this repo's root unless absolute.
+_cactlib = get_option('cactlib')
+cactlib = _cactlib.startswith('/') ? _cactlib : src_root / _cactlib
+_drmuapi = get_option('drmuapi')
+drmuapi = _drmuapi.startswith('/') ? _drmuapi : src_root / _drmuapi
+_lr_lib = get_option('lr_lib')
+lr_lib = _lr_lib.startswith('/') ? _lr_lib : src_root / _lr_lib
+_cpkg_py = get_option('cpkg_py')
+cpkg_py = _cpkg_py.startswith('/') ? _cpkg_py : src_root / _cpkg_py
 
-if ['windows', 'darwin'].contains(host_machine.system())
-  error('unsupported OS: @0@'.format(host_machine.system()))
+cactlib_inc = cactlib / 'include'
+if not fs.is_dir(cactlib_inc)
+  error('CactLibc headers not found at ' + cactlib_inc +
+        '  —  checkout the sibling repo or pass -Dcactlib=<path>')
+endif
+if not fs.is_file(drmuapi / 'drm.h')
+  error('DRM uapi headers not found at ' + drmuapi +
+        '  —  build CactKernel first or pass -Ddrmuapi=<path>')
 endif
 
-pkg = import('pkgconfig')
-
-config = configuration_data()
-
-config.set10('UDEV', get_option('udev'))
-with_freedreno_kgsl = get_option('freedreno-kgsl')
-with_install_tests = get_option('install-test-programs')
-with_tests = get_option('tests')
-
-dep_threads = dependency('threads')
-
-cc = meson.get_compiler('c')
-
-config.set10('HAVE_SECURE_GETENV', cc.has_function('secure_getenv'))
-
-android = cc.compiles('''int func() { return __ANDROID__; }''')
-
-# Solaris / Illumos
-if host_machine.system() == 'sunos'
-  add_global_arguments('-D__EXTENSIONS__', language : 'c')
-  add_global_arguments('-D_POSIX_C_SOURCE=3', language : 'c')
-endif
-
-symbols_check = find_program('symbols-check.py')
-prog_nm = find_program('nm')
-
-# Check for atomics
-intel_atomics = false
-lib_atomics = false
-
-python3 = import('python').find_installation()
-format_mod_static_table = custom_target(
-  'format_mod_static_table',
-  output : 'generated_static_table_fourcc.h',
-  input : 'include/drm/drm_fourcc.h',
-  command : [python3, files('gen_table_fourcc.py'), '@INPUT@', '@OUTPUT@'])
-
-dep_atomic_ops = dependency('atomic_ops', required : false)
-if cc.links('''
-    int atomic_add(int *i) { return __sync_add_and_fetch (i, 1); }
-    int atomic_cmpxchg(int *i, int j, int k) { return __sync_val_compare_and_swap (i, j, k); }
-    int main() { }
-    ''',
-    name : 'Intel Atomics')
-  intel_atomics = true
-  with_atomics = true
-  dep_atomic_ops = []
-elif dep_atomic_ops.found()
-  lib_atomics = true
-  with_atomics = true
-elif cc.has_function('atomic_cas_uint')
-  with_atomics = true
-else
-  with_atomics = false
-endif
-
-config.set10('HAVE_LIBDRM_ATOMIC_PRIMITIVES', intel_atomics)
-config.set10('HAVE_LIB_ATOMIC_OPS', lib_atomics)
-
-dep_pciaccess = dependency('pciaccess', version : '>= 0.10', required : get_option('intel'))
-
-with_intel = get_option('intel') \
-  .require(with_atomics, error_message : 'libdrm_intel requires atomics') \
-  .require(dep_pciaccess.found(), error_message : 'libdrm_intel requires libpciaccess') \
-  .disable_auto_if(not host_machine.cpu_family().startswith('x86')) \
-  .allowed()
-summary('Intel', with_intel)
-
-with_radeon = get_option('radeon') \
-  .require(with_atomics, error_message : 'libdrm_radeon requires atomics') \
-  .allowed()
-summary('Radeon', with_radeon)
-
-with_amdgpu = get_option('amdgpu') \
-  .require(with_atomics, error_message : 'libdrm_amdgpu requires atomics') \
-  .allowed()
-summary('AMDGPU', with_amdgpu)
-
-with_nouveau = get_option('nouveau') \
-  .require(with_atomics, error_message : 'libdrm_nouveau requires atomics') \
-  .allowed()
-summary('Nouveau', with_nouveau)
-
-with_vmwgfx = get_option('vmwgfx').allowed()
-summary('vmwgfx', with_vmwgfx)
-
-with_omap = get_option('omap') \
-  .require(with_atomics, error_message : 'libdrm_omap requires atomics') \
-  .enabled()
-summary('OMAP', with_omap)
-
-with_freedreno = get_option('freedreno') \
-  .require(with_atomics, error_message : 'libdrm_freedreno requires atomics') \
-  .disable_auto_if(not ['arm', 'aarch64'].contains(host_machine.cpu_family())) \
-  .allowed()
-summary('Freedreno', with_freedreno)
-summary('Freedreon-kgsl', with_freedreno_kgsl)
-
-with_tegra = get_option('tegra') \
-  .require(with_atomics, error_message : 'libdrm_tegra requires atomics') \
-  .disable_auto_if(not ['arm', 'aarch64'].contains(host_machine.cpu_family())) \
-  .enabled()
-summary('Tegra', with_tegra)
-
-with_etnaviv = get_option('etnaviv') \
-  .require(with_atomics, error_message : 'libdrm_etnaviv requires atomics') \
-  .disable_auto_if(not ['arm', 'aarch64', 'arc', 'mips', 'mips64', 'loongarch64'].contains(host_machine.cpu_family())) \
-  .allowed()
-summary('Etnaviv', with_etnaviv)
-
-with_exynos = get_option('exynos').enabled()
-summary('EXYNOS', with_exynos)
-
-with_vc4 = get_option('vc4') \
-  .disable_auto_if(not ['arm', 'aarch64'].contains(host_machine.cpu_family())) \
-  .allowed()
-summary('VC4', with_vc4)
-
-# Among others FreeBSD does not have a separate dl library.
-if not cc.has_function('dlsym')
-  dep_dl = cc.find_library('dl', required : with_nouveau)
-else
-  dep_dl = []
-endif
-# clock_gettime might require -rt, or it might not. find out
-if not cc.has_function('clock_gettime', prefix : '#define _GNU_SOURCE\n#include <time.h>')
-  # XXX: untested
-  dep_rt = cc.find_library('rt')
-else
-  dep_rt = []
-endif
-
-# The header is not required on Linux, and is in fact deprecated in glibc 2.30+
-if host_machine.system() == 'linux'
-  config.set10('HAVE_SYS_SYSCTL_H', false)
-else
-  # From Niclas Zeising:
-  # FreeBSD requires sys/types.h for sys/sysctl.h, so add it as part of
-  # the includes when checking for headers.
-  config.set10('HAVE_SYS_SYSCTL_H',
-    cc.compiles('#include <sys/types.h>\n#include <sys/sysctl.h>', name : 'sys/sysctl.h works'))
-endif
-
-foreach header : ['sys/select.h', 'alloca.h']
-  config.set10('HAVE_' + header.underscorify().to_upper(), cc.check_header(header))
-endforeach
-
-if (cc.has_header_symbol('sys/sysmacros.h', 'major') and
-  cc.has_header_symbol('sys/sysmacros.h', 'minor') and
-  cc.has_header_symbol('sys/sysmacros.h', 'makedev'))
-  config.set10('MAJOR_IN_SYSMACROS', true)
-endif
-if (cc.has_header_symbol('sys/mkdev.h', 'major') and
-  cc.has_header_symbol('sys/mkdev.h', 'minor') and
-  cc.has_header_symbol('sys/mkdev.h', 'makedev'))
-  config.set10('MAJOR_IN_MKDEV', true)
-endif
-config.set10('HAVE_OPEN_MEMSTREAM', cc.has_function('open_memstream'))
-
-libdrm_c_args = cc.get_supported_arguments([
-  '-Wsign-compare', '-Werror=undef', '-Werror=implicit-function-declaration',
-  '-Wpointer-arith', '-Wwrite-strings', '-Wstrict-prototypes',
-  '-Wmissing-prototypes', '-Wmissing-declarations', '-Wnested-externs',
-  '-Wpacked', '-Wswitch-enum', '-Wmissing-format-attribute',
-  '-Wstrict-aliasing=2', '-Winit-self', '-Winline', '-Wshadow',
-  '-Wdeclaration-after-statement', '-Wold-style-definition',
-  '-Wno-unused-parameter', '-Wno-attributes', '-Wno-long-long',
-  '-Wno-missing-field-initializers'])
-
-dep_cairo = dependency('cairo', required : get_option('cairo-tests'))
-with_cairo_tests = dep_cairo.found()
-
-valgrind_version = []
-if with_freedreno
-  valgrind_version = '>=3.10.0'
-endif
-dep_valgrind = dependency('valgrind', required : get_option('valgrind'), version : valgrind_version)
-with_valgrind = dep_valgrind.found()
-
-prog_rst2man = find_program('rst2man', 'rst2man.py', required: get_option('man-pages'))
-with_man_pages = prog_rst2man.found()
-
-config.set10('HAVE_VISIBILITY', cc.has_function_attribute('visibility:hidden'))
-
-foreach t : [
-             [with_exynos, 'EXYNOS'],
-             [with_freedreno_kgsl, 'FREEDRENO_KGSL'],
-             [with_intel, 'INTEL'],
-             [with_nouveau, 'NOUVEAU'],
-             [with_radeon, 'RADEON'],
-             [with_vc4, 'VC4'],
-             [with_vmwgfx, 'VMWGFX'],
-             [with_cairo_tests, 'CAIRO'],
-             [with_valgrind, 'VALGRIND'],
-            ]
-  config.set10('HAVE_@0@'.format(t[1]), t[0])
-endforeach
-if with_freedreno_kgsl and not with_freedreno
-  error('cannot enable freedreno-kgsl without freedreno support')
-endif
-config.set10('_GNU_SOURCE', true)
-
-if target_machine.endian() == 'big'
-  config.set('HAVE_BIG_ENDIAN', 1)
-endif
-
-if android
-  config.set('BIONIC_IOCTL_NO_SIGNEDNESS_OVERLOAD', 1)
-endif
-
-config_file = configure_file(
-  configuration : config,
-  output : 'config.h',
-)
-add_project_arguments('-include', meson.current_build_dir() / 'config.h', language : 'c')
-
-inc_root = include_directories('.')
-inc_drm = include_directories('include/drm')
-
-libdrm_files = [files(
-   'xf86drm.c', 'xf86drmHash.c', 'xf86drmRandom.c', 'xf86drmSL.c',
-   'xf86drmMode.c'
-  ),
-  config_file, format_mod_static_table
+# libdrm is vendored, so its warnings stay out of the CactOS build log.  config.h
+# pins the platform probes (see config.h) and is force-included exactly as
+# upstream force-includes the file it generates.
+libdrm_c_args = [
+  '-ffreestanding', '-fno-stack-protector', '-nostdlib',
+  '-include', src_root / 'config.h',
+  '-I' + src_root,
+  '-I' + drmuapi,
+  '-I' + cactlib_inc,
+  '-I' + build_root,
+  '-w',
 ]
 
-# Build an unversioned so on android
-if android
-  libdrm_kw = {}
-else
-  libdrm_kw = { 'version' : '2.@0@.0'.format(patch_ver) }
-endif
+libdrm_files = [
+  'xf86drm.c', 'xf86drmHash.c', 'xf86drmRandom.c', 'xf86drmSL.c', 'xf86drmMode.c',
+]
 
-libdrm = library(
-  'drm',
-  libdrm_files,
-  c_args : libdrm_c_args,
-  dependencies : [dep_valgrind, dep_rt],
-  include_directories : inc_drm,
-  install : true,
-  kwargs : libdrm_kw,
-  gnu_symbol_visibility : 'hidden',
-)
+# xf86drm.c includes "generated_static_table_fourcc.h", produced upstream by
+# gen_table_fourcc.py from the uapi drm_fourcc.h.
+fourcc_table = custom_target('fourcc-table',
+  input: drmuapi / 'drm_fourcc.h',
+  output: 'generated_static_table_fourcc.h',
+  command: [python3, src_root / 'gen_table_fourcc.py', '@INPUT@', '@OUTPUT@'])
 
-test(
-  'core-symbols-check',
-  symbols_check,
-  args : [
-    '--lib', libdrm,
-    '--symbols-file', files('core-symbols.txt'),
-    '--nm', prog_nm.full_path(),
-  ],
-)
+libdrm_a = static_library('drm',
+  [files(libdrm_files), fourcc_table],
+  c_args: libdrm_c_args,
+  pic: true)
 
-ext_libdrm = declare_dependency(
-  link_with : libdrm,
-  include_directories : [inc_root, inc_drm],
-)
+libdrm_so = custom_target('libdrm-so',
+  input: libdrm_a,
+  output: 'libdrm.so',
+  command: [ld, '-m', 'elf_x86_64', '-shared', '-nostdlib',
+            '--hash-style=both', '-soname=libdrm.so',
+            '-T', src_root / 'libdrm.ld', '-o', '@OUTPUT@',
+            '--whole-archive', libdrm_a, '--no-whole-archive'],
+  depend_files: files('libdrm.ld'),
+  build_by_default: true)
 
-meson.override_dependency('libdrm', ext_libdrm)
+# ------------------------------------------------------------------------------
+# Stage into the image tree and build the package
+# ------------------------------------------------------------------------------
 
-install_headers('libsync.h', 'xf86drm.h', 'xf86drmMode.h')
-install_headers(
-  'include/drm/drm.h', 'include/drm/drm_fourcc.h', 'include/drm/drm_mode.h',
-  'include/drm/drm_sarea.h', 'include/drm/i915_drm.h',
-  'include/drm/mach64_drm.h', 'include/drm/mga_drm.h',
-  'include/drm/msm_drm.h', 'include/drm/nouveau_drm.h',
-  'include/drm/qxl_drm.h', 'include/drm/r128_drm.h',
-  'include/drm/radeon_drm.h', 'include/drm/amdgpu_drm.h',
-  'include/drm/savage_drm.h', 'include/drm/sis_drm.h',
-  'include/drm/tegra_drm.h', 'include/drm/vc4_drm.h',
-  'include/drm/via_drm.h', 'include/drm/virtgpu_drm.h',
-  subdir : 'libdrm',
-)
-if with_vmwgfx
-  install_headers('include/drm/vmwgfx_drm.h', subdir : 'libdrm')
-endif
+inc_dir = lr_lib / 'include' / 'libdrm'
+libdrm_headers = ['xf86drm.h', 'xf86drmMode.h', 'libdrm_lists.h', 'libdrm_macros.h']
 
-pkg.generate(
-  libdrm,
-  name : 'libdrm',
-  subdirs : ['.', 'libdrm'],
-  description : 'Userspace interface to kernel DRM services',
-)
+_headers = ''
+foreach h : libdrm_headers
+  _headers += 'cp -f "' + src_root / h + '" "' + inc_dir + '/' + h + '"; '
+endforeach
 
-if with_intel
-  subdir('intel')
-endif
-if with_nouveau
-  subdir('nouveau')
-endif
-if with_radeon
-  subdir('radeon')
-endif
-if with_amdgpu
-  subdir('amdgpu')
-endif
-if with_omap
-  subdir('omap')
-endif
-if with_exynos
-  subdir('exynos')
-endif
-if with_freedreno
-  subdir('freedreno')
-endif
-if with_tegra
-  subdir('tegra')
-endif
-if with_vc4
-  subdir('vc4')
-endif
-if with_etnaviv
-  subdir('etnaviv')
-endif
-if with_man_pages
-  subdir('man')
-endif
-subdir('data')
-if with_tests
-  subdir('tests')
-endif
+run_target('stage',
+  command: [bash, '-c',
+            'set -e; mkdir -p "' + lr_lib + '" "' + inc_dir + '"; ' +
+            'cp -f "$1" "' + lr_lib + '/libdrm.so"; ' + _headers,
+            'bash', libdrm_so])
+
+pkg_src = src_root / 'pkg' / 'libdrm'
+pkg_repo = src_root / 'repo'
+
+run_target('pkg',
+  command: [bash, '-c',
+            'set -e; ' +
+            'rm -rf "$1/payload"; mkdir -p "$1/payload/lib" "$1/payload/include/libdrm" "$2"; ' +
+            'cp -f "$3" "$1/payload/lib/libdrm.so"; ' +
+            'for h in ' + ' '.join(libdrm_headers) + '; do ' +
+            'cp -f "' + src_root + '/$h" "$1/payload/include/libdrm/$h"; done; ' +
+            python3.full_path() + ' "$4" build "$1" --repo "$2"; ' +
+            python3.full_path() + ' "$4" index "$2"',
+            'bash', pkg_src, pkg_repo, libdrm_so, cpkg_py])

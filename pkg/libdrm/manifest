@@ -1,0 +1,4 @@
+name: libdrm
+version: 2.4.134
+arch: x86_64
+description: libdrm core (DRM ioctl/KMS helpers) for CactOS

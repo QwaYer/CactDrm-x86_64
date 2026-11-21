@@ -1,1 +1,6 @@
 /build*
+
+# CactOS port: the assembled package payload and the local .cpkg repository it
+# produces (see meson.build).
+/repo/
+/pkg/*/payload/
