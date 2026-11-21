@@ -65,11 +65,11 @@ endif
 # pins the platform probes (see config.h) and is force-included exactly as
 # upstream force-includes the file it generates.
 libdrm_c_args = [
-  '-ffreestanding', '-fno-stack-protector', '-nostdlib',
+  '-ffreestanding', '-fno-stack-protector', '-nostdlib', '-nostdlibinc',
   '-include', src_root / 'config.h',
   '-I' + src_root,
   '-I' + drmuapi,
-  '-I' + cactlib_inc,
+  '-isystem', cactlib_inc,
   '-I' + build_root,
   '-w',
 ]
