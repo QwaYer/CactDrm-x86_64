@@ -124,7 +124,7 @@ pkg_repo = src_root / 'repo'
 run_target('pkg',
   command: [bash, '-c',
             'set -e; ' +
-            'rm -rf "$1/payload"; mkdir -p "$1/payload/lib" "$1/payload/include/libdrm" "$2"; ' +
+            'rm -f "$2"/*.cpkg; rm -rf "$1/payload"; mkdir -p "$1/payload/lib" "$1/payload/include/libdrm" "$2"; ' +
             'cp -f "$3" "$1/payload/lib/libdrm.so"; ' +
             'for h in ' + ' '.join(libdrm_headers) + '; do ' +
             'cp -f "' + src_root + '/$h" "$1/payload/include/libdrm/$h"; done; ' +
