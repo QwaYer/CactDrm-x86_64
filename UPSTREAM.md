@@ -46,7 +46,7 @@ keeping CactOS's files.
 2. **`config.h` is hand-written**, because CactOS is a known target rather than
    a probed one (see the file for what each answer means).
 3. **Soname is `libdrm.so`**, not `libdrm.so.2`: ld.so and `dlopen()` resolve a
-   `DT_NEEDED` name as a file under `/usr/lib`, and the cctkfs image carries no
+   `DT_NEEDED` name as a file under `/usr/lib`, and the localbinrepo image carries no
    symlinks.
 4. **`-w`**: libdrm is vendored third-party code, so its warnings stay out of
    the CactOS build log.
